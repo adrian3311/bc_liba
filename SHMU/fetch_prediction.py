@@ -1,203 +1,428 @@
-"""
-Stiahne SHMU ALADIN GRIB predikcie pre zvoleny datum a runy.
+#!/usr/bin/env python3
+"""SHMU climate-now: hodinovy vyber dat podla datumu, mesta a typu dat."""
 
-Priklad zdroja:
-https://opendata.shmu.sk/meteorology/weather/nwp/aladin/sk/4.5km/20260203/0000/
-"""
+from __future__ import annotations
 
 import argparse
+import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+import sys
+import unicodedata
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
-from urllib.parse import urljoin
+from urllib.parse import quote, unquote
 
+import pandas as pd
 import requests
+from maping import build_ind_kli_map
 
-DEFAULT_BASE_URL = "https://opendata.shmu.sk/meteorology/weather/nwp/aladin/sk/4.5km"
-DEFAULT_RUNS = ["0000", "0600", "1200", "1800"]
+BASE_URL = "https://opendata.shmu.sk/meteorology/climate/now/data"
+MS_PDF_URL = "https://www.shmu.sk/File/metaklin/ms.pdf"
+HREF_JSON_RE = re.compile(r'href=["\']([^"\']+\.json)["\']', re.IGNORECASE)
+FILE_RE = re.compile(
+    r"^(?P<dtype>.+?) - (?P<date>\d{4}-\d{2}-\d{2}) (?P<clock>\d{2}-\d{2}-\d{2})\.json$"
+)
+@dataclass(frozen=True)
+class DayFile:
+    name: str
+    data_type: str
+    timestamp: datetime
+
+    @property
+    def encoded_name(self) -> str:
+        return quote(self.name, safe="-_.~")
+
+
+@dataclass(frozen=True)
+class Station:
+    ind_kli: str
+    name: str
+
+
+def normalize_text(value: str) -> str:
+    base = unicodedata.normalize("NFKD", value)
+    no_acc = "".join(ch for ch in base if not unicodedata.combining(ch))
+    return " ".join(re.sub(r"[^a-zA-Z0-9\s-]", " ", no_acc).lower().split())
+
+
+def parse_date(value: str) -> date:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"Neplatny datum '{value}', pouzi YYYY-MM-DD") from exc
+
+
+def resolve_days(args: argparse.Namespace) -> list[date]:
+    if args.date:
+        if args.start_date or args.end_date:
+            raise ValueError("Pouzi bud --date alebo dvojicu --start-date a --end-date.")
+        return [parse_date(args.date)]
+
+    if bool(args.start_date) != bool(args.end_date):
+        raise ValueError("Pri intervale musis zadat aj --start-date aj --end-date.")
+
+    if not args.start_date and not args.end_date:
+        raise ValueError("Zadaj --date alebo --start-date a --end-date.")
+
+    start_day = parse_date(args.start_date)
+    end_day = parse_date(args.end_date)
+    if start_day > end_day:
+        raise ValueError("start-date musi byt mensi alebo rovny end-date.")
+
+    days: list[date] = []
+    current = start_day
+    while current <= end_day:
+        days.append(current)
+        current += timedelta(days=1)
+    return days
+
+
+def day_url(day: date) -> str:
+    return f"{BASE_URL}/{day.strftime('%Y%m%d')}/"
+
+
+def parse_day_file_name(filename: str) -> DayFile | None:
+    match = FILE_RE.match(filename)
+    if not match:
+        return None
+
+    ts = datetime.strptime(
+        f"{match.group('date')} {match.group('clock').replace('-', ':')}",
+        "%Y-%m-%d %H:%M:%S",
+    )
+    return DayFile(name=filename, data_type=match.group("dtype"), timestamp=ts)
+
+
+def list_day_files(session: requests.Session, day: date, verify_ssl: bool) -> list[DayFile]:
+    response = session.get(day_url(day), timeout=40, verify=verify_ssl)
+    response.raise_for_status()
+
+    unique: dict[str, DayFile] = {}
+    for href in HREF_JSON_RE.findall(response.text):
+        name = Path(unquote(href)).name
+        parsed = parse_day_file_name(name)
+        if parsed:
+            unique[name] = parsed
+
+    return sorted(unique.values(), key=lambda item: item.timestamp)
+
+
+def select_hourly_files(files: list[DayFile], wanted_type: str) -> list[DayFile]:
+    groups: dict[int, list[DayFile]] = defaultdict(list)
+    for file in files:
+        if file.data_type != wanted_type:
+            continue
+        groups[file.timestamp.hour].append(file)
+
+    selected: list[DayFile] = []
+    for hour in sorted(groups):
+        hour_files = sorted(groups[hour], key=lambda f: f.timestamp)
+        exact = next((f for f in hour_files if f.timestamp.minute == 0), None)
+        selected.append(exact or hour_files[0])
+
+    return selected
+
+
+def download_json(
+    session: requests.Session,
+    day: date,
+    file_meta: DayFile,
+    output_dir: Path,
+    verify_ssl: bool,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / file_meta.name
+
+    if not target.exists():
+        url = f"{day_url(day)}{file_meta.encoded_name}"
+        response = session.get(url, timeout=60, verify=verify_ssl)
+        response.raise_for_status()
+        target.write_bytes(response.content)
+
+    return target
+
+
+def load_station_map(session: requests.Session, verify_ssl: bool) -> list[Station]:
+    response = session.get(MS_PDF_URL, timeout=50, verify=verify_ssl)
+    response.raise_for_status()
+
+    mapping = build_ind_kli_map(response.content)
+    return [Station(ind_kli=ind_kli, name=name) for ind_kli, name in mapping.items()]
+
+
+def resolve_ind_kli_for_city(stations: list[Station], city: str) -> Station:
+    needle = normalize_text(city)
+
+    # Automaticky vyhľadaj "-letisko" variant pre Bratislavu a Košice
+    if needle in ["bratislava", "kosice"]:
+        airport_name = f"{needle}-letisko"
+        airport_stations = [s for s in stations if normalize_text(s.name) == airport_name]
+        if airport_stations:
+            return airport_stations[0]
+
+    # Fallback: presné mestá
+    exact = [s for s in stations if normalize_text(s.name) == needle]
+    if exact:
+        return exact[0]
+
+    # Fallback: čiastočná zhoda
+    partial = [s for s in stations if needle in normalize_text(s.name)]
+    if partial:
+        return partial[0]
+
+    raise ValueError(f"Mesto '{city}' sa nenaslo v ms.pdf mapovani.")
+
+
+def select_record_for_station(payload: dict, ind_kli: str) -> dict | None:
+    records = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return None
+
+    station_rows = [row for row in records if str(row.get("ind_kli")) == ind_kli]
+    if not station_rows:
+        return None
+
+    # Preferuj presne xx:00, inak najblizsi zaznam v subore.
+    on_hour = [r for r in station_rows if str(r.get("minuta", "")).endswith(":00")]
+    if on_hour:
+        return on_hour[0]
+
+    return station_rows[0]
+
+
+def resolve_requested_fields(args: argparse.Namespace) -> list[str]:
+    if args.fields:
+        return [field.strip() for field in args.fields.split(",") if field.strip()]
+    if args.field:
+        return [args.field.strip()]
+    return []
+
+
+def format_selected_values(record: dict, fields: list[str]) -> str:
+    return " | ".join(f"{field}={record.get(field)}" for field in fields)
+
+
+def fetch_shmu_data(
+    city: str,
+    start_date: str,
+    end_date: str,
+    fields: list[str],
+    data_type: str = "aws1min",
+    output_dir: str = "SHMU/downloadsNow",
+    verify_ssl: bool = True,
+) -> tuple[str, str, pd.DataFrame]:
+    start_day = parse_date(start_date)
+    end_day = parse_date(end_date)
+    if start_day > end_day:
+        raise ValueError("start_date must be before or equal to end_date")
+
+    session = requests.Session()
+    stations = load_station_map(session, verify_ssl)
+    try:
+        station = resolve_ind_kli_for_city(stations, city)
+    except ValueError:
+        # Keep helper API usable without raising when station is missing.
+        return city, "", pd.DataFrame()
+
+    days: list[date] = []
+    current = start_day
+    while current <= end_day:
+        days.append(current)
+        current += timedelta(days=1)
+
+    rows: list[dict] = []
+    base_fields = [field for field in fields if field]
+
+    for selected_day in days:
+        day_files = list_day_files(session, selected_day, verify_ssl)
+        hourly_files = select_hourly_files(day_files, data_type)
+        out_dir = Path(output_dir) / selected_day.strftime("%Y%m%d") / data_type
+
+        for item in hourly_files:
+            local_path = download_json(session, selected_day, item, out_dir, verify_ssl)
+            payload = json.loads(local_path.read_text(encoding="utf-8"))
+            record = select_record_for_station(payload, station.ind_kli)
+            if record is None:
+                continue
+
+            row = {
+                "date": item.timestamp,
+                "minuta": record.get("minuta"),
+                "ind_kli": station.ind_kli,
+            }
+            for field in base_fields:
+                row[field] = record.get(field)
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty and "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return station.name, station.ind_kli, df
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="SHMU ALADIN GRIB downloader")
-    ap.add_argument("--date", required=True, help="Datum: YYYYMMDD alebo D.M.YYYY (napr. 11.2.2026)")
-    ap.add_argument("--runs", default=",".join(DEFAULT_RUNS), help="CSV runov, napr. 0000,0600,1200,1800")
-    ap.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Zakladna URL SHMU ALADIN")
-    ap.add_argument("--out-dir", default="SHMU/downloadsPredictions", help="Cielovy priecinok")
-    ap.add_argument("--workers", type=int, default=8, help="Pocet paralelnych download workerov")
-    ap.add_argument("--timeout", type=int, default=60, help="HTTP timeout v sekundach")
-    ap.add_argument("--skip-existing", action="store_true", help="Preskoc uz stiahnute subory")
-    ap.add_argument("--dry-run", action="store_true", help="Len vypis co by sa stiahlo")
-    ap.add_argument("--insecure", action="store_true", help="Vypne SSL verifikaciu (ak treba)")
-    ap.add_argument(
-        "--expected-counts",
-        default="0000:103,0600:73,1200:73,1800:73",
-        help="Ocakavane pocty suborov na run, napr. 0000:103,0600:73",
+    parser = argparse.ArgumentParser(
+        description="SHMU: zadaj miesto, datum od-do a typ dat; skript vypise najdene hodnoty"
     )
-    return ap.parse_args()
-
-
-def parse_expected_counts(value: str) -> dict[str, int]:
-    return {run.strip(): int(count.strip()) for item in value.split(",")
-            for run, count in [item.split(":")] if item.strip()}
-
-
-def normalize_runs(value: str) -> list[str]:
-    return [x.strip() for x in value.split(",") if x.strip()]
-
-
-def run_url(base_url: str, date_yyyymmdd: str, run_hhmm: str) -> str:
-    return f"{base_url.rstrip('/')}/{date_yyyymmdd}/{run_hhmm}/"
-
-
-def date_url(base_url: str, date_yyyymmdd: str) -> str:
-    return f"{base_url.rstrip('/')}/{date_yyyymmdd}/"
-
-
-def check_date_route_exists(session: requests.Session, base_url: str, date_yyyymmdd: str, timeout: int, verify: bool) -> bool:
-    """Overi, ci existuje datumova trasa na SHMU (napr. .../20260211/)."""
-    try:
-        resp = session.get(date_url(base_url, date_yyyymmdd), timeout=timeout, verify=verify)
-        return resp.status_code != 404
-    except:
-        return False
-
-
-def list_grb_links(session: requests.Session, directory_url: str, timeout: int, verify: bool) -> list[tuple[str, str]]:
-    resp = session.get(directory_url, timeout=timeout, verify=verify)
-    resp.raise_for_status()
-    hrefs = re.findall(r'href="([^"]+\.grb)"', resp.text, flags=re.IGNORECASE)
-    return [(href.split("/")[-1], urljoin(directory_url, href)) for href in hrefs
-            if href.lower().endswith(".grb")]
-
-
-def download_file(session: requests.Session, file_url: str, dest: Path, timeout: int, verify: bool) -> tuple[bool, str]:
-    try:
-        with session.get(file_url, stream=True, timeout=timeout, verify=verify) as r:
-            r.raise_for_status()
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with dest.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 512):
-                    if chunk:
-                        f.write(chunk)
-        return True, "ok"
-    except Exception as exc:
-        return False, str(exc)
-
-
-def batched(iterable: list, n: int) -> list:
-    return [iterable[i:i+n] for i in range(0, len(iterable), n)]
-
-
-def normalize_input_date(value: str) -> str:
-    """Prijme datum od pouzivatela a vrati YYYYMMDD.
-
-    Podporene formaty:
-    - YYYYMMDD (napr. 20260211)
-    - D.M.YYYY alebo DD.MM.YYYY (napr. 11.2.2026)
-    """
-    value = value.strip()
-
-    if re.fullmatch(r"\d{8}", value):
-        # over validitu aj pre YYYYMMDD vstup
-        datetime.strptime(value, "%Y%m%d")
-        return value
-
-    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
-        try:
-            dt = datetime.strptime(value, fmt)
-            # dvojmiestny rok (yy) moze viesť k 1926; pouzivame ho len ak zadany format sedel
-            # a date parser uz doplnil storocie podla python pravidiel.
-            return dt.strftime("%Y%m%d")
-        except ValueError:
-            continue
-
-    raise ValueError(
-        f"Neplatny format datumu: '{value}'. Pouzi YYYYMMDD alebo D.M.YYYY (napr. 11.2.2026)."
+    parser.add_argument("--date", "--datum", default="", help="Jeden datum vo formate YYYY-MM-DD")
+    parser.add_argument(
+        "--start-date", "--from-date", "--od",
+        default="",
+        dest="start_date",
+        help="Zaciatok intervalu vo formate YYYY-MM-DD",
     )
+    parser.add_argument(
+        "--end-date", "--to-date", "--do",
+        default="",
+        dest="end_date",
+        help="Koniec intervalu vo formate YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--city", "--place", "--miesto",
+        required=True,
+        dest="city",
+        help="Mesto/stanica, napr. Zilina",
+    )
+    parser.add_argument(
+        "--field", "--data-type", "--typ-dat",
+        default="",
+        dest="field",
+        help="Jeden JSON kluc, napr. t alebo vlh_rel",
+    )
+    parser.add_argument(
+        "--fields", "--data-types", "--typy-dat",
+        default="",
+        dest="fields",
+        help="Viac JSON klucov oddelenych ciarkou, napr. t,vlh_rel,zra_uhrn",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Vypise cely najdeny record pod danym ind_kli",
+    )
+    parser.add_argument(
+        "--list-fields",
+        action="store_true",
+        help="Vypise dostupne kluce v recorde pre dane ind_kli a skonci",
+    )
+    parser.add_argument(
+        "--type", "--dataset-type", "--file-type",
+        default="aws1min",
+        dest="type",
+        help="Typ SHMU suborov, default aws1min",
+    )
+    parser.add_argument("--output-dir", default="SHMU/downloadsNow", help="Kde ulozit JSON subory")
+    parser.add_argument("--insecure", action="store_true", help="Vypne SSL verifikaciu")
+    parser.add_argument("--dry-run", action="store_true", help="Len vypise co by sa stiahlo")
+    return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
-    date_yyyymmdd = normalize_input_date(args.date)
-    runs = normalize_runs(args.runs)
-    expected_counts = parse_expected_counts(args.expected_counts)
-    verify = not args.insecure
+    verify_ssl = not args.insecure
+    selected_fields = resolve_requested_fields(args)
+
+    try:
+        selected_days = resolve_days(args)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
     session = requests.Session()
-    session.headers.update({"User-Agent": "SHMU-GRB-Downloader/1.0"})
 
-    if not check_date_route_exists(session, args.base_url, date_yyyymmdd, timeout=args.timeout, verify=verify):
-        print(f"CHYBA: Trasa pre datum neexistuje: {date_url(args.base_url, date_yyyymmdd)}")
-        return
+    try:
+        stations = load_station_map(session, verify_ssl)
+        station = resolve_ind_kli_for_city(stations, args.city)
+    except requests.RequestException as exc:
+        print(f"Chyba pri nacitani mapovania ms.pdf: {exc}", file=sys.stderr)
+        return 1
+    except ValueError:
+        print(f"No data for {args.city}")
+        return 0
 
-    root_out = Path(args.out_dir) / date_yyyymmdd
-    root_out.mkdir(parents=True, exist_ok=True)
-
-    print(f"Datum (vstup): {args.date}")
-    print(f"Datum (normalizovany): {date_yyyymmdd}")
-    print(f"Runy: {', '.join(runs)}")
-    print(f"Output: {root_out}")
-    print(f"Mode: {'DRY-RUN' if args.dry_run else 'DOWNLOAD'}")
-
-    all_tasks: list[tuple[str, str, Path]] = []
-
-    for run in runs:
-        directory = run_url(args.base_url, date_yyyymmdd, run)
+    selected_by_day: list[tuple[date, list[DayFile]]] = []
+    listing_errors = 0
+    for selected_day in selected_days:
         try:
-            links = list_grb_links(session, directory, timeout=args.timeout, verify=verify)
-        except Exception as exc:
-            print(f"\n[{run}] CHYBA pri listovani: {exc}")
+            day_files = list_day_files(session, selected_day, verify_ssl)
+        except requests.RequestException as exc:
+            listing_errors += 1
+            print(
+                f"Chyba pri citani denneho priecinka {selected_day.isoformat()}: {exc}",
+                file=sys.stderr,
+            )
             continue
 
-        found = len(links)
-        expected = expected_counts.get(run)
-        status = "OK"
-        if expected is not None and found != expected:
-            status = f"MIMO OCAKAVANIA (expected={expected})"
+        hourly_files = select_hourly_files(day_files, args.type)
+        if hourly_files:
+            selected_by_day.append((selected_day, hourly_files))
 
-        print(f"\n[{run}] najdenych .grb: {found} -> {status}")
+    if not selected_by_day:
+        print("Pre zvoleny datum/typ neboli najdene subory.")
+        return 1 if listing_errors else 0
 
-        run_out = root_out / run
-        for filename, url in links:
-            dest = run_out / filename
-            if args.skip_existing and dest.exists():
+    total_hourly_files = sum(len(files) for _, files in selected_by_day)
+
+    print(f"Mesto: {station.name} | ind_kli: {station.ind_kli}")
+    if args.record:
+        print(f"Typ dat: cely record | Suborovy typ: {args.type}")
+    elif selected_fields:
+        print(f"Typ dat: {', '.join(selected_fields)} | Suborovy typ: {args.type}")
+    else:
+        print(f"Typ dat: cely record | Suborovy typ: {args.type}")
+    if len(selected_days) == 1:
+        print(f"Hodinovych suborov: {total_hourly_files}")
+    else:
+        print(
+            f"Interval: {selected_days[0].isoformat()} -> {selected_days[-1].isoformat()} | Hodinovych suborov: {total_hourly_files}"
+        )
+
+    for selected_day, hourly_files in selected_by_day:
+        out_dir = Path(args.output_dir) / selected_day.strftime("%Y%m%d") / args.type
+
+        for item in hourly_files:
+            url = f"{day_url(selected_day)}{item.encoded_name}"
+            if args.dry_run:
+                print(f"[dry-run] {selected_day.isoformat()} {item.timestamp.strftime('%H:%M')} -> {url}")
                 continue
-            all_tasks.append((filename, url, dest))
 
-    print(f"\nNa stiahnutie spolu: {len(all_tasks)} suborov")
+            try:
+                local_path = download_json(session, selected_day, item, out_dir, verify_ssl)
+                payload = json.loads(local_path.read_text(encoding="utf-8"))
+            except (requests.RequestException, json.JSONDecodeError) as exc:
+                print(f"Preskakujem {item.name}: {exc}", file=sys.stderr)
+                continue
 
-    if args.dry_run:
-        for i, (filename, url, dest) in enumerate(all_tasks[:20], start=1):
-            print(f"  {i:02d}. {filename} -> {dest}")
-        if len(all_tasks) > 20:
-            print(f"  ... a dalsich {len(all_tasks) - 20}")
-        return
+            record = select_record_for_station(payload, station.ind_kli)
+            if record is None:
+                print(
+                    f"{selected_day.isoformat()} {item.timestamp.strftime('%H:%M')} | bez zaznamu pre ind_kli {station.ind_kli}"
+                )
+                continue
 
-    ok = 0
-    fail = 0
+            if args.list_fields:
+                print("Dostupne kluce:")
+                for key in sorted(record.keys()):
+                    print(f"- {key}")
+                return 0
 
-    # Mensie batch-e pomahaju drzat output prehladny pri velkom pocte suborov.
-    for batch in batched(all_tasks, max(1, args.workers * 4)):
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futures = {
-                ex.submit(download_file, session, url, dest, args.timeout, verify): (filename, dest)
-                for filename, url, dest in batch
-            }
-            for fut in as_completed(futures):
-                filename, dest = futures[fut]
-                success, msg = fut.result()
-                if success:
-                    ok += 1
-                else:
-                    fail += 1
-                    print(f"CHYBA: {filename} -> {msg}")
+            minute = str(record.get("minuta", ""))
+            prefix = f"{selected_day.isoformat()} {item.timestamp.strftime('%H:%M')} | minuta={minute}"
 
-    print("\n=== SUMAR ===")
-    print(f"Uspech: {ok}")
-    print(f"Chyby:  {fail}")
-    print(f"Output: {root_out}")
+            if args.record or not selected_fields:
+                print(f"{prefix} | record={json.dumps(record, ensure_ascii=False)}")
+                continue
+
+            print(f"{prefix} | {format_selected_values(record, selected_fields)}")
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+
+
+
+

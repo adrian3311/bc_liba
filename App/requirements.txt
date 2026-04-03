@@ -1,0 +1,8 @@
+streamlit
+pandas
+requests
+pypdf
+openmeteo-requests
+requests-cache
+retry-requests
+

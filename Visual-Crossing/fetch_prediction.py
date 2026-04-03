@@ -22,8 +22,8 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 BASE_URL = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
-DEFAULT_HOURLY = "temp,cloudcover,precip,humidity,windspeed,solarradiation"
-DEFAULT_DAILY  = "tempmax,tempmin,temp,precip,humidity,windspeed,solarradiation"
+DEFAULT_HOURLY = "temp,cloudcover,precip,humidity,windspeed,winddir,windgust,solarradiation,solarenergy,uvindex,conditions,visibility,pressure,dewpoint,snow,snowdepth,preciptype,feelslike,cape"
+DEFAULT_DAILY  = "tempmax,tempmin,temp,precip,humidity,windspeed,winddir,windgust,solarradiation,solarenergy,uvindex,conditions,visibility,pressure,dewpoint,snow,snowdepth,preciptype,feelslike,moonrise,moonset,sunrise,sunset,moonphase,precipcover,severerisk"
 
 
 def parse_date(value: str) -> str:

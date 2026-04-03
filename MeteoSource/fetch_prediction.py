@@ -29,8 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", required=True, help="Datum od (YYYY-MM-DD)")
     parser.add_argument("--end-date", required=True, help="Datum do (YYYY-MM-DD)")
     parser.add_argument("--mode", choices=["hourly", "daily"], default="daily", help="Rezim: hourly alebo daily")
-    parser.add_argument("--hourly", default="temperature,wind_speed,cloud_cover,precipitation_sum", help="Hodinove premenne (csv)")
-    parser.add_argument("--daily", default="temperature,precipitation_sum", help="Denne premenne (csv)")
+    parser.add_argument("--hourly", default="temperature,wind_speed,wind_direction,cloud_cover,precipitation_sum,pressure,humidity,dew_point,uv_index,visibility,feels_like,weather", help="Hodinove premenne (csv)")
+    parser.add_argument("--daily", default="temperature,temperature_min,temperature_max,precipitation_sum,wind_speed,cloud_cover,pressure,humidity,uv_index,visibility,weather", help="Denne premenne (csv)")
     parser.add_argument("--api-key", default=os.getenv("METEOSOURCE_API_KEY", ""), help="API kluc alebo env METEOSOURCE_API_KEY")
     parser.add_argument("--output-csv", default="", help="Volitelny vystupny CSV subor")
     parser.add_argument("--dry-run", action="store_true", help="Iba vypise URL bez stahovania dat")
@@ -105,10 +105,8 @@ def extract_daily_rows(payload: dict, variables: list[str], start_date: str, end
         all_day = entry.get("all_day", {})
         row = {"date": dt}
         for var in variables:
-            # Skus najprv v all_day sekcii
             if var in all_day:
                 row[var] = all_day.get(var)
-            # Ak premenna ma nested strukturu (napr. wind, cloud_cover), extrakt flat
             elif var == "temperature":
                 row[var] = all_day.get("temperature")
             elif var == "temperature_min":
@@ -116,14 +114,27 @@ def extract_daily_rows(payload: dict, variables: list[str], start_date: str, end
             elif var == "temperature_max":
                 row[var] = all_day.get("temperature_max")
             elif var == "wind_speed":
-                wind = all_day.get("wind", {})
-                row[var] = wind.get("speed")
+                row[var] = all_day.get("wind", {}).get("speed")
+            elif var == "wind_direction":
+                row[var] = all_day.get("wind", {}).get("angle")
             elif var == "cloud_cover":
-                cloud = all_day.get("cloud_cover", {})
-                row[var] = cloud.get("total")
+                row[var] = all_day.get("cloud_cover", {}).get("total")
             elif var == "precipitation_sum":
-                precip = all_day.get("precipitation", {})
-                row[var] = precip.get("total")
+                row[var] = all_day.get("precipitation", {}).get("total")
+            elif var == "precipitation_type":
+                row[var] = all_day.get("precipitation", {}).get("type")
+            elif var == "pressure":
+                row[var] = all_day.get("pressure")
+            elif var == "humidity":
+                row[var] = all_day.get("humidity")
+            elif var == "dew_point":
+                row[var] = all_day.get("dew_point")
+            elif var == "uv_index":
+                row[var] = all_day.get("uv_index")
+            elif var == "visibility":
+                row[var] = all_day.get("visibility")
+            elif var == "weather":
+                row[var] = all_day.get("weather")
             else:
                 row[var] = all_day.get(var)
         rows.append(row)
@@ -147,20 +158,34 @@ def extract_hourly_rows(payload: dict, variables: list[str], start_date: str, en
 
         row = {"date": dt_full}
         for var in variables:
-            # Hodinove premenne su vo flat strukture alebo nested
             if var in entry:
                 row[var] = entry.get(var)
             elif var == "temperature":
                 row[var] = entry.get("temperature")
             elif var == "wind_speed":
-                wind = entry.get("wind", {})
-                row[var] = wind.get("speed")
+                row[var] = entry.get("wind", {}).get("speed")
+            elif var == "wind_direction":
+                row[var] = entry.get("wind", {}).get("angle")
             elif var == "cloud_cover":
-                cloud = entry.get("cloud_cover", {})
-                row[var] = cloud.get("total")
+                row[var] = entry.get("cloud_cover", {}).get("total")
             elif var == "precipitation_sum":
-                precip = entry.get("precipitation", {})
-                row[var] = precip.get("total")
+                row[var] = entry.get("precipitation", {}).get("total")
+            elif var == "precipitation_type":
+                row[var] = entry.get("precipitation", {}).get("type")
+            elif var == "pressure":
+                row[var] = entry.get("pressure")
+            elif var == "humidity":
+                row[var] = entry.get("humidity")
+            elif var == "dew_point":
+                row[var] = entry.get("dew_point")
+            elif var == "uv_index":
+                row[var] = entry.get("uv_index")
+            elif var == "visibility":
+                row[var] = entry.get("visibility")
+            elif var == "feels_like":
+                row[var] = entry.get("feels_like")
+            elif var == "weather":
+                row[var] = entry.get("weather")
             else:
                 row[var] = entry.get(var)
         rows.append(row)

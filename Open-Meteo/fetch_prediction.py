@@ -51,8 +51,8 @@ def parse_args():
     ap.add_argument("--start-date", required=True, help="Datum od (YYYY-MM-DD)")
     ap.add_argument("--end-date", required=True, help="Datum do (YYYY-MM-DD)")
     ap.add_argument("--mode", choices=["hourly", "daily"], default="hourly", help="Rezolucia dat")
-    ap.add_argument("--hourly", default="temperature_2m,cloud_cover", help="Hodinove premenne (csv)")
-    ap.add_argument("--daily", default="sunshine_duration", help="Denne premenne (csv)")
+    ap.add_argument("--hourly", default="temperature_2m,cloud_cover,rain,snowfall,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,shortwave_radiation,direct_radiation,diffuse_radiation,precipitation,weather_code,visibility,wind_gusts_10m,soil_temperature_0cm,soil_moisture_0_to_1cm,cape,et0_fao_evapotranspiration,vapour_pressure_deficit", help="Hodinove premenne (csv)")
+    ap.add_argument("--daily", default="temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,rain_sum,snowfall_sum,precipitation_hours,sunshine_duration,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,shortwave_radiation_sum,et0_fao_evapotranspiration,weather_code", help="Denne premenne (csv)")
     ap.add_argument("--timezone", default="auto", help="Casova zona")
     return ap.parse_args()
 

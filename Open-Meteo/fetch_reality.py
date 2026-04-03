@@ -3,6 +3,7 @@ Skript na ziskanie realnych dat (teplota, oblacnost) z Open-Meteo archive API.
 """
 
 import argparse
+import time
 from datetime import datetime
 
 from openmeteo_utils import create_client, resolve_city_to_coords, response_to_dataframe
@@ -28,10 +29,20 @@ def fetch_reality_data(
         "timezone": timezone,
         mode: ",".join(variables),
     }
-    responses = client.weather_api(REALITY_URL, params=params)
-    if not responses:
-        raise RuntimeError("Reality API nevratilo ziadne odpovede.")
-    return responses[0]
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            responses = client.weather_api(REALITY_URL, params=params)
+            if not responses:
+                raise RuntimeError("Reality API nevratilo ziadne odpovede.")
+            return responses[0]
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+
+    raise RuntimeError(f"Reality API zlyhalo po 3 pokusoch: {last_error}")
 
 
 def parse_date(value: str) -> str:
@@ -50,8 +61,8 @@ def parse_args():
     ap.add_argument("--start-date", required=True, help="Datum od (YYYY-MM-DD)")
     ap.add_argument("--end-date", required=True, help="Datum do (YYYY-MM-DD)")
     ap.add_argument("--mode", choices=["hourly", "daily"], default="hourly", help="Rezolucia dat")
-    ap.add_argument("--hourly", default="temperature_2m,cloud_cover,rain,snowfall", help="Hodinove premenne (csv)")
-    ap.add_argument("--daily", default="sunshine_duration,precipitation_hours", help="Denne premenne (csv)")
+    ap.add_argument("--hourly", default="temperature_2m,cloud_cover,rain,snowfall,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,shortwave_radiation,direct_radiation,diffuse_radiation,precipitation,weather_code,visibility,wind_gusts_10m,soil_temperature_0cm,soil_moisture_0_to_1cm,et0_fao_evapotranspiration,vapour_pressure_deficit", help="Hodinove premenne (csv)")
+    ap.add_argument("--daily", default="temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,rain_sum,snowfall_sum,precipitation_hours,sunshine_duration,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,shortwave_radiation_sum,et0_fao_evapotranspiration,weather_code", help="Denne premenne (csv)")
     ap.add_argument("--timezone", default="auto", help="Casova zona")
     return ap.parse_args()
 

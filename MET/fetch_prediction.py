@@ -5,7 +5,9 @@ Endpoint:     https://api.met.no/weatherapi/locationforecast/2.0/complete
 """
 
 import argparse
+import math
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 import requests
@@ -20,22 +22,30 @@ FORECAST_URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
 VARIABLE_MAP = {
     "temperature_2m":           ("instant", "air_temperature"),
     "cloud_cover":              ("instant", "cloud_area_fraction"),
+    "cloud_cover_low":          ("instant", "cloud_area_fraction_low"),
+    "cloud_cover_medium":       ("instant", "cloud_area_fraction_medium"),
+    "cloud_cover_high":         ("instant", "cloud_area_fraction_high"),
     "wind_speed":               ("instant", "wind_speed"),
     "wind_direction":           ("instant", "wind_from_direction"),
+    "wind_speed_gust":          ("instant", "wind_speed_of_gust"),
     "humidity":                 ("instant", "relative_humidity"),
     "pressure":                 ("instant", "air_pressure_at_sea_level"),
     "dew_point":                ("instant", "dew_point_temperature"),
     "fog":                      ("instant", "fog_area_fraction"),
+    "uv_index":                 ("instant", "ultraviolet_index_clear_sky"),
     "precipitation_1h":         ("next_1_hours", "precipitation_amount"),
     "precipitation_6h":         ("next_6_hours", "precipitation_amount"),
     "precipitation_12h":        ("next_12_hours", "precipitation_amount"),
+    "precipitation_prob_1h":    ("next_1_hours", "probability_of_precipitation"),
+    "precipitation_prob_6h":    ("next_6_hours", "probability_of_precipitation"),
+    "thunder_prob_1h":          ("next_1_hours", "probability_of_thunder"),
+    "thunder_prob_6h":          ("next_6_hours", "probability_of_thunder"),
     "symbol_1h":                ("next_1_hours", "summary_symbol_code"),
     "symbol_6h":                ("next_6_hours", "summary_symbol_code"),
     "symbol_12h":               ("next_12_hours", "summary_symbol_code"),
-    "uv_index":                 ("instant", "ultraviolet_index_clear_sky"),
 }
 
-DEFAULT_VARIABLES = "temperature_2m,cloud_cover,precipitation_1h,wind_speed,humidity"
+DEFAULT_VARIABLES = "temperature_2m,cloud_cover,precipitation_1h,wind_speed,wind_direction,humidity,pressure,dew_point,uv_index,fog,wind_speed_gust,precipitation_prob_1h,thunder_prob_1h"
 
 
 def resolve_city(city: str) -> tuple[float, float, str]:
@@ -149,7 +159,78 @@ Priklady:
     )
     ap.add_argument("--altitude", type=int, default=None, help="Nadmorska vyska v metroch (volitelne)")
     ap.add_argument("--dry-run", action="store_true", help="Iba zobraz URL bez stahovania dat")
+    ap.add_argument(
+        "--mode",
+        choices=["hourly", "daily"],
+        default="hourly",
+        help="Rezolucia vystupu: hourly alebo daily (agregacia po UTC dnoch).",
+    )
     return ap.parse_args()
+
+
+def _to_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(num):
+        return None
+    return num
+
+
+def aggregate_daily_rows(filtered: list[dict], variables: list[str]) -> tuple[list[dict], list[str]]:
+    """Agreguje hodinove zaznamy na denny vystup (UTC)."""
+    by_day: dict[str, dict[str, list[object]]] = {}
+
+    for entry in filtered:
+        time_str = entry.get("time", "")
+        try:
+            dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+
+        day_key = dt.date().isoformat()
+        if day_key not in by_day:
+            by_day[day_key] = {var: [] for var in variables}
+
+        for var in variables:
+            by_day[day_key][var].append(extract_variable(entry, var))
+
+    rows: list[dict] = []
+    output_columns: list[str] = []
+    for var in variables:
+        if var == "temperature_2m":
+            output_columns.extend([f"{var}_min", f"{var}_max", f"{var}_mean"])
+        elif var.startswith("precipitation_"):
+            output_columns.append(f"{var}_sum")
+        elif var.startswith("symbol_"):
+            output_columns.append(f"{var}_mode")
+        else:
+            output_columns.append(f"{var}_mean")
+
+    for day_key in sorted(by_day.keys()):
+        out = {"date": day_key}
+        for var in variables:
+            vals = by_day[day_key][var]
+            nums = [n for n in (_to_float(v) for v in vals) if n is not None]
+
+            if var == "temperature_2m":
+                out[f"{var}_min"] = min(nums) if nums else None
+                out[f"{var}_max"] = max(nums) if nums else None
+                out[f"{var}_mean"] = (sum(nums) / len(nums)) if nums else None
+            elif var.startswith("precipitation_"):
+                out[f"{var}_sum"] = sum(nums) if nums else None
+            elif var.startswith("symbol_"):
+                labels = [str(v) for v in vals if v is not None and str(v).strip()]
+                out[f"{var}_mode"] = Counter(labels).most_common(1)[0][0] if labels else None
+            else:
+                out[f"{var}_mean"] = (sum(nums) / len(nums)) if nums else None
+
+        rows.append(out)
+
+    return rows, output_columns
 
 
 def main():
@@ -195,47 +276,75 @@ def main():
 
     if not filtered:
         print("\nZiadne data pre zadane casove rozmedzie.")
-        print(f"Tip: MET Norway poskytuje predpoved typicky na 9-10 dni dopredu od aktualneho datumu.")
+        print("Tip: MET Norway poskytuje predpoved typicky na 9-10 dni dopredu od aktualneho datumu.")
         return
 
-    # --- Vypis hlavicky ---
-    header_parts = ["Cas (UTC)"]
-    for var in variables:
-        _, field = VARIABLE_MAP[var]
-        unit = units.get(field, "")
-        header_parts.append(f"{var}({unit})" if unit else var)
+    rows_to_print: list[dict] = []
+    columns_to_print: list[str] = []
+
+    if args.mode == "daily":
+        rows_to_print, columns_to_print = aggregate_daily_rows(filtered, variables)
+        print(f"Dennych agregovanych zaznamov: {len(rows_to_print)}")
+        if not rows_to_print:
+            print("\nZiadne agregovane data pre zadane obdobie.")
+            return
+    else:
+        columns_to_print = list(variables)
+        for entry in filtered:
+            row = {"date": entry.get("time", "")}
+            for var in variables:
+                row[var] = extract_variable(entry, var)
+            rows_to_print.append(row)
+
+    first_col = "Cas (UTC)" if args.mode == "hourly" else "Datum (UTC)"
+    header_parts = [first_col]
+    for col in columns_to_print:
+        base_var = col
+        suffix = ""
+        for tail in ("_min", "_max", "_mean", "_sum", "_mode"):
+            if col.endswith(tail):
+                base_var = col[: -len(tail)]
+                suffix = tail
+                break
+
+        unit = ""
+        if base_var in VARIABLE_MAP:
+            _, field = VARIABLE_MAP[base_var]
+            unit = units.get(field, "")
+
+        header_parts.append(f"{col}({unit})" if unit and suffix != "_mode" else col)
 
     col_w = 28
-    var_w = 20
-    header = f"{'Cas (UTC)':<{col_w}}" + "".join(f"{h:<{var_w}}" for h in header_parts[1:])
-    sep = "-" * (col_w + var_w * len(variables))
+    var_w = 24
+    header = f"{first_col:<{col_w}}" + "".join(f"{h:<{var_w}}" for h in header_parts[1:])
+    sep = "-" * (col_w + var_w * len(columns_to_print))
 
     print(f"\n{'=' * len(sep)}")
-    print(f"PREDIKCNE DATA (MET Norway): {args.city}")
+    title = "PREDIKCNE DATA" if args.mode == "hourly" else "DENNE AGREGOVANE DATA"
+    print(f"{title} (MET Norway): {args.city}")
     print(f"{'=' * len(sep)}")
     print(f"Obdobie: {args.start_date} az {args.end_date}")
+    print(f"Mode: {args.mode}")
     print(f"Premenne: {', '.join(variables)}")
     print(f"\n{header}")
     print(sep)
 
-    stats: dict[str, list] = {v: [] for v in variables}
+    stats: dict[str, list[float]] = {c: [] for c in columns_to_print}
 
-    for entry in filtered:
-        time_str = entry.get("time", "")
-        row = f"{time_str:<{col_w}}"
-        for var in variables:
-            val = extract_variable(entry, var)
+    for row_data in rows_to_print:
+        row = f"{str(row_data.get('date', '')):<{col_w}}"
+        for col in columns_to_print:
+            val = row_data.get(col)
             if val is None:
                 cell = "N/A"
             elif isinstance(val, float):
                 cell = f"{val:.1f}"
-                stats[var].append(val)
             else:
                 cell = str(val)
-                try:
-                    stats[var].append(float(val))
-                except (ValueError, TypeError):
-                    pass
+
+            num = _to_float(val)
+            if num is not None:
+                stats[col].append(num)
             row += f"{cell:<{var_w}}"
         print(row)
 
@@ -243,12 +352,12 @@ def main():
     print(f"\n{'=' * len(sep)}")
     print("STATISTIKY")
     print(f"{'=' * len(sep)}")
-    for var in variables:
-        vals = stats[var]
+    for col in columns_to_print:
+        vals = stats[col]
         if vals:
-            print(f"  {var:<25} Min={min(vals):.2f}  Max={max(vals):.2f}  Priemer={sum(vals)/len(vals):.2f}")
+            print(f"  {col:<25} Min={min(vals):.2f}  Max={max(vals):.2f}  Priemer={sum(vals)/len(vals):.2f}")
         else:
-            print(f"  {var:<25} (ziadne numericke hodnoty)")
+            print(f"  {col:<25} (ziadne numericke hodnoty)")
 
 
 if __name__ == "__main__":
