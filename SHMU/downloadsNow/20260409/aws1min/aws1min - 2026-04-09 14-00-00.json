@@ -1,0 +1,11 @@
+{
+  "id": "fefa4eb5-1a51-4323-a966-e572fe85968b",
+  "dataset": "Automatic stations",
+  "interval": "1 minute",
+  "frequency": "5 minute",
+  "statistics": {
+    "stations_count": 0,
+    "records_count": 0
+  },
+  "data": []
+}

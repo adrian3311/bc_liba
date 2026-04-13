@@ -62,10 +62,8 @@ SOLCAST_ERR = ""
 
 try:
     _om_pred = _load_module("om_fetch_prediction", OPEN_METEO_DIR / "fetch_prediction.py")
-    _om_real = _load_module("om_fetch_reality",    OPEN_METEO_DIR / "fetch_reality.py")
     _om_util = _load_module("om_utils",            OPEN_METEO_DIR / "openmeteo_utils.py")
     om_fetch_prediction   = _om_pred.fetch_prediction_data
-    om_fetch_reality      = _om_real.fetch_reality_data
     om_create_client      = _om_util.create_client
     om_resolve_city       = _om_util.resolve_city_to_coords
     om_to_dataframe       = _om_util.response_to_dataframe
@@ -125,6 +123,24 @@ except Exception as e:
     SOLCAST_OK = False
     SOLCAST_ERR = str(e)
 
+CUSTOM_PROVIDER_ORDER = ["openmeteo", "visualcrossing", "met", "meteosource", "shmu", "solcast"]
+CUSTOM_PROVIDER_LABELS = {
+    "openmeteo": "Open-Meteo",
+    "visualcrossing": "Visual Crossing",
+    "met": "MET",
+    "meteosource": "MeteoSource",
+    "shmu": "SHMU",
+    "solcast": "Solcast",
+}
+CUSTOM_PROVIDER_INDEX = {
+    "openmeteo": 0,
+    "visualcrossing": 1,
+    "met": 2,
+    "meteosource": 3,
+    "solcast": 4,
+}
+CUSTOM_PROVIDER_KEY_BY_LABEL = {v: k for k, v in CUSTOM_PROVIDER_LABELS.items()}
+
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _clean_met_city_name(name: str) -> str:
@@ -180,22 +196,95 @@ def _show_comparison(merged: pd.DataFrame, variables: list[str], key_suffix: str
     comp = comp.set_index("date").rename(columns={pc: "prediction", rc: "reality"})
     st.line_chart(comp)
 
-    metrics = []
-    for var in variables:
-        p, r = f"{var}_pred", f"{var}_real"
-        if p not in merged.columns or r not in merged.columns:
-            continue
-        v = merged[[p, r]].apply(pd.to_numeric, errors="coerce").dropna()
-        if v.empty:
-            continue
-        d = v[p] - v[r]
-        metrics.append({"variable": var, "count": len(v),
-                         "mae": round(d.abs().mean(), 4),
-                         "rmse": round((d**2).mean()**0.5, 4),
-                         "bias": round(d.mean(), 4)})
-    if metrics:
+    metrics_df = _compute_pred_real_metrics(merged, variables)
+    if not metrics_df.empty:
         st.subheader("Metrics (prediction - reality)")
-        st.dataframe(pd.DataFrame(metrics), use_container_width=True)
+        st.caption("Only rows where both prediction and reality data exist are used.")
+        st.dataframe(metrics_df, use_container_width=True)
+
+
+def _compute_pred_real_metrics(merged: pd.DataFrame, labels: list[str]) -> pd.DataFrame:
+    metrics: list[dict] = []
+    for label in labels:
+        pred_col, real_col = f"{label}_pred", f"{label}_real"
+        if pred_col not in merged.columns or real_col not in merged.columns:
+            continue
+        pair = merged[[pred_col, real_col]].apply(pd.to_numeric, errors="coerce").dropna()
+        if pair.empty:
+            continue
+        delta = pair[pred_col] - pair[real_col]
+        corr = pair[pred_col].corr(pair[real_col])
+        metrics.append(
+            {
+                "variable": label,
+                "matched": len(pair),
+                "total": len(merged),
+                "mae": round(delta.abs().mean(), 4),
+                "rmse": round((delta**2).mean() ** 0.5, 4),
+                "bias": round(delta.mean(), 4),
+                "correlation": round(corr, 4) if pd.notna(corr) else None,
+            }
+        )
+    return pd.DataFrame(metrics)
+
+
+def _show_provider_comparison_metrics(merged_df: pd.DataFrame, labels: list[str]):
+    metrics_df = _compute_pred_real_metrics(merged_df, labels)
+    if metrics_df.empty:
+        st.info("No matched rows for metrics.")
+        return
+    st.subheader("Metrics (prediction - reality)")
+    st.caption("Only rows where both prediction and reality data exist are used.")
+    st.dataframe(metrics_df, use_container_width=True)
+
+
+def _compute_pairwise_metrics_for_variable(merged_df: pd.DataFrame, provider_cols: list[str]) -> pd.DataFrame:
+    metrics: list[dict] = []
+    cols = [c for c in provider_cols if c in merged_df.columns]
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            a, b = cols[i], cols[j]
+            pair = merged_df[[a, b]].apply(pd.to_numeric, errors="coerce").dropna()
+            if pair.empty:
+                continue
+            delta = pair[a] - pair[b]
+            corr = pair[a].corr(pair[b])
+            metrics.append(
+                {
+                    "provider_a": a,
+                    "provider_b": b,
+                    "matched": len(pair),
+                    "total": len(merged_df),
+                    "mae": round(delta.abs().mean(), 4),
+                    "rmse": round((delta**2).mean() ** 0.5, 4),
+                    "bias (a-b)": round(delta.mean(), 4),
+                    "correlation": round(corr, 4) if pd.notna(corr) else None,
+                }
+            )
+    return pd.DataFrame(metrics)
+
+
+def _show_provider_comparison_table(merged_df: pd.DataFrame, labels: list[str], key_suffix: str):
+    if merged_df.empty or not labels:
+        st.info("No comparable prediction/reality data.")
+        return
+
+    table_cols = ["date"]
+    rename_map: dict[str, str] = {}
+    for label in labels:
+        pred_col = f"{label}_pred"
+        real_col = f"{label}_real"
+        if pred_col in merged_df.columns and real_col in merged_df.columns:
+            table_cols.extend([pred_col, real_col])
+            rename_map[pred_col] = f"{label}_prediction"
+            rename_map[real_col] = f"{label}_reality"
+
+    if len(table_cols) == 1:
+        st.info("No comparable prediction/reality data.")
+        return
+
+    table_df = merged_df[table_cols].copy().rename(columns=rename_map)
+    _show_df("Prediction + Reality", table_df, f"cmp_{key_suffix}", city, date_from, date_to)
 
 
 def _normalize_date_series(series: pd.Series) -> pd.Series:
@@ -244,33 +333,36 @@ def _build_provider_comparison_df(
     r["date"] = _normalize_date_series(r["date"])
 
     p_cols = set(p.columns)
-    merged = None
     comparable_labels: list[str] = []
+    pred_rename: dict[str, str] = {}
+    real_rename: dict[str, str] = {}
 
     for label in selected_labels:
         om_col = variable_map[label][0]
         provider_base = variable_map[label][provider_index]
         if om_col is None or provider_base is None or om_col not in r.columns:
             continue
-
         provider_col = _resolve_provider_col(provider_base, label, p_cols, mode)
         if provider_col is None:
             continue
-
-        left = p[["date", provider_col]].rename(columns={provider_col: f"{label}_pred"})
-        right = r[["date", om_col]].rename(columns={om_col: f"{label}_real"})
-        pair = pd.merge(left, right, on="date", how="inner")
-        if pair.empty:
-            continue
-
         comparable_labels.append(label)
-        merged = pair if merged is None else pd.merge(merged, pair, on="date", how="outer")
+        pred_rename[provider_col] = f"{label}_pred"
+        real_rename[om_col] = f"{label}_real"
 
-    if merged is None or merged.empty:
+    if not comparable_labels:
         return pd.DataFrame(), []
 
-    merged = merged.sort_values("date").reset_index(drop=True)
-    return merged, comparable_labels
+    # One single merge — preserves all timestamps, no iterative outer-join gaps
+    pred_cols = list(dict.fromkeys(["date"] + list(pred_rename.keys())))
+    real_cols = list(dict.fromkeys(["date"] + list(real_rename.keys())))
+    left = p[pred_cols].drop_duplicates(subset=["date"]).rename(columns=pred_rename)
+    right = r[real_cols].drop_duplicates(subset=["date"]).rename(columns=real_rename)
+
+    merged = pd.merge(left, right, on="date", how="left")
+    if merged.empty:
+        return pd.DataFrame(), []
+
+    return merged.sort_values("date").reset_index(drop=True), comparable_labels
 
 
 def _show_provider_comparison_chart(merged_df: pd.DataFrame, labels: list[str], key_suffix: str):
@@ -291,6 +383,93 @@ def _show_provider_comparison_chart(merged_df: pd.DataFrame, labels: list[str], 
     st.line_chart(chart_df)
 
 
+def _resolve_custom_provider_column(
+    provider_key: str,
+    label: str,
+    provider_df: pd.DataFrame,
+    variable_map: dict,
+    shmu_variable_map: dict,
+    mode: str,
+) -> str | None:
+    if provider_key == "shmu":
+        shmu_col = shmu_variable_map.get(label)
+        if shmu_col and shmu_col in provider_df.columns:
+            return shmu_col
+        return None
+
+    provider_idx = CUSTOM_PROVIDER_INDEX.get(provider_key)
+    if provider_idx is None or label not in variable_map:
+        return None
+    provider_base = variable_map[label][provider_idx]
+    if provider_base is None:
+        return None
+    return _resolve_provider_col(provider_base, label, set(provider_df.columns), mode)
+
+
+def _build_custom_provider_comparison_df(
+    provider_frames: dict[str, pd.DataFrame],
+    provider_keys: list[str],
+    label: str,
+    variable_map: dict,
+    shmu_variable_map: dict,
+    mode: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    pieces: list[pd.DataFrame] = []
+    used_labels: list[str] = []
+
+    for provider_key in provider_keys:
+        df = provider_frames.get(provider_key, pd.DataFrame())
+        if df.empty or "date" not in df.columns:
+            continue
+        provider_col = _resolve_custom_provider_column(
+            provider_key, label, df, variable_map, shmu_variable_map, mode
+        )
+        if provider_col is None:
+            continue
+
+        display_name = CUSTOM_PROVIDER_LABELS[provider_key]
+        part = df[["date", provider_col]].copy()
+        part["date"] = _normalize_date_series(part["date"])
+        part = part.drop_duplicates(subset=["date"]).rename(columns={provider_col: display_name})
+        part[display_name] = pd.to_numeric(part[display_name], errors="coerce")
+        pieces.append(part)
+        used_labels.append(display_name)
+
+    if len(pieces) < 2:
+        return pd.DataFrame(), []
+
+    merged = pieces[0]
+    for part in pieces[1:]:
+        merged = pd.merge(merged, part, on="date", how="outer")
+
+    return merged.sort_values("date").reset_index(drop=True), used_labels
+
+
+def _get_custom_comparable_labels(
+    provider_frames: dict[str, pd.DataFrame],
+    provider_keys: list[str],
+    selected_labels: list[str],
+    variable_map: dict,
+    shmu_variable_map: dict,
+    mode: str,
+) -> list[str]:
+    comparable: list[str] = []
+    for label in selected_labels:
+        supported_count = 0
+        for provider_key in provider_keys:
+            df = provider_frames.get(provider_key, pd.DataFrame())
+            if df.empty:
+                continue
+            provider_col = _resolve_custom_provider_column(
+                provider_key, label, df, variable_map, shmu_variable_map, mode
+            )
+            if provider_col is not None:
+                supported_count += 1
+        if supported_count >= 2:
+            comparable.append(label)
+    return comparable
+
+
 # ── cached loaders ──────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
@@ -298,17 +477,25 @@ def load_openmeteo(city, start_date, end_date, mode, variables, timezone, source
     client, session = om_create_client()
     lat, lon, city_name = om_resolve_city(session, city)
     frames: dict[str, pd.DataFrame] = {}
-    if source in ("prediction", "both"):
+    if source in ("prediction", "both", "custom"):
         r = om_fetch_prediction(client, lat, lon, start_date, end_date, list(variables), timezone, mode)
         frames["prediction"] = om_to_dataframe(r, list(variables), mode)
-    if source in ("reality", "both"):
-        r = om_fetch_reality(client, lat, lon, start_date, end_date, list(variables), timezone, mode)
-        frames["reality"] = om_to_dataframe(r, list(variables), mode)
-    merged = None
-    if source == "both" and "prediction" in frames and "reality" in frames:
-        merged = pd.merge(frames["prediction"], frames["reality"], on="date",
-                          how="inner", suffixes=("_pred", "_real"))
-    return city_name, lat, lon, frames, merged
+    return city_name, lat, lon, frames
+
+
+@st.cache_data(show_spinner=False)
+def load_shmu_reality_baseline(city, start_date, end_date, shmu_fields, verify_ssl):
+    city_name, ind_kli, df = shmu_fetch_data(
+        city=city,
+        start_date=start_date,
+        end_date=end_date,
+        fields=list(shmu_fields),
+        data_type=DEFAULT_SHMU_DATA_TYPE,
+        verify_ssl=verify_ssl,
+    )
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return city_name, ind_kli, df
 
 
 @st.cache_data(show_spinner=False)
@@ -432,8 +619,13 @@ with st.sidebar:
     date_from = st.date_input("Start date")
     date_to = st.date_input("End date")
     mode = st.selectbox("Mode", ["hourly", "daily"])
-    om_source = st.selectbox("Source", ["predictions", "reality", "both"])
-    om_source_internal = {"predictions": "prediction", "reality": "reality", "both": "both"}[om_source]
+    om_source = st.selectbox("Source", ["predictions", "reality", "both", "custom"])
+    om_source_internal = {
+        "predictions": "prediction",
+        "reality": "reality",
+        "both": "both",
+        "custom": "custom",
+    }[om_source]
 
     # Shared variables — mapping OM name -> VC -> MET -> MeteoSource
     if mode == "hourly":
@@ -532,12 +724,24 @@ with st.sidebar:
     st.subheader("SHMU")
     use_shmu = st.checkbox("Enable SHMU", value=True)
 
+    custom_provider_keys: list[str] = []
+    if om_source_internal == "custom":
+        custom_provider_labels = st.multiselect(
+            "Providers for custom comparison",
+            options=[CUSTOM_PROVIDER_LABELS[k] for k in CUSTOM_PROVIDER_ORDER],
+            default=[CUSTOM_PROVIDER_LABELS["openmeteo"], CUSTOM_PROVIDER_LABELS["met"]],
+        )
+        custom_provider_keys = [CUSTOM_PROVIDER_KEY_BY_LABEL[l] for l in custom_provider_labels]
+
     run_btn = st.button("Load data", type="primary")
 
 solcast_api_key = SOLCAST_API_KEY
 
 # ── Hlavná plocha ──────────��───────────────────────────────────────────────
-if not run_btn:
+if run_btn:
+    st.session_state["data_loaded"] = True
+
+if not st.session_state.get("data_loaded", False):
     st.info("Click **Load data** in the sidebar.")
     st.stop()
 
@@ -545,10 +749,22 @@ if date_from > date_to:
     st.error("Start date must be before or equal to end date.")
     st.stop()
 
-om_reality_baseline = pd.DataFrame()
+if om_source_internal == "custom":
+    use_openmeteo = use_openmeteo and ("openmeteo" in custom_provider_keys)
+    use_visualcrossing = use_visualcrossing and ("visualcrossing" in custom_provider_keys)
+    use_met = use_met and ("met" in custom_provider_keys)
+    use_meteosource = use_meteosource and ("meteosource" in custom_provider_keys)
+    use_shmu = use_shmu and ("shmu" in custom_provider_keys)
+    use_solcast = use_solcast and ("solcast" in custom_provider_keys)
 
+om_reality_baseline = pd.DataFrame()
+provider_frames: dict[str, pd.DataFrame] = {}
+
+custom_mode = om_source_internal == "custom"
 reality_only_mode = om_source_internal == "reality"
-if reality_only_mode:
+if custom_mode:
+    pass
+elif reality_only_mode:
     col_om = st.container()
     shmu_container, solcast_container = st.columns(2)
 else:
@@ -557,28 +773,87 @@ else:
     shmu_container, solcast_container = st.columns(2)
 
 # ── Open-Meteo stĺpec ──────────────────────────────────────────────────────
-with col_om:
-    st.header("🌍 Open-Meteo")
-    try:
-        if not use_openmeteo:
-            st.info("Open-Meteo is disabled in the sidebar.")
-        elif not OM_OK:
-            st.error(f"Module load failed: {OM_ERR}")
-        elif not om_variables:
-            st.warning("Select at least one variable.")
-        else:
-            with st.spinner("Loading Open-Meteo..."):
-                try:
-                    city_name_om, lat, lon, frames, merged = load_openmeteo(
-                        city, str(date_from), str(date_to), mode,
-                        tuple(om_variables), om_timezone, om_source_internal,
-                    )
-                except Exception:
-                    _show_provider_fetch_notice()
-                    frames, merged, lat, lon = {}, None, None, None
-                    city_name_om = city
+if not custom_mode:
+    with col_om:
+        st.header("🇸🇰 SHMU" if om_source_internal == "reality" else "🌍 Open-Meteo")
+        try:
+            shmu_caption_name = None
+            shmu_caption_ind_kli = None
+            if not use_openmeteo:
+                st.info("Open-Meteo is disabled in the sidebar.")
+            elif not OM_OK:
+                st.error(f"Module load failed: {OM_ERR}")
+            elif not om_variables:
+                st.warning("Select at least one variable.")
+            else:
+                with st.spinner("Loading Open-Meteo..."):
+                    try:
+                        city_name_om, lat, lon, frames = load_openmeteo(
+                            city, str(date_from), str(date_to), mode,
+                            tuple(om_variables), om_timezone, om_source_internal,
+                        )
+                    except Exception:
+                        _show_provider_fetch_notice()
+                        frames, lat, lon = {}, None, None
+                        city_name_om = city
 
-            if lat is not None:
+            if om_source_internal in ("reality", "both"):
+                if not SHMU_OK:
+                    st.error(f"SHMU module load failed for reality source: {SHMU_ERR}")
+                elif mode != "hourly":
+                    st.info("Reality source currently supports hourly mode only (SHMU).")
+                elif not shmu_variables:
+                    st.warning("No SHMU-equivalent variables for current selection.")
+                else:
+                    with st.spinner("Loading SHMU baseline for reality..."):
+                        try:
+                            shmu_caption_name, shmu_caption_ind_kli, shmu_reality_df = load_shmu_reality_baseline(
+                                city,
+                                str(date_from),
+                                str(date_to),
+                                tuple(shmu_variables),
+                                SHMU_VERIFY_SSL,
+                            )
+                        except Exception:
+                            _show_provider_fetch_notice()
+                            shmu_reality_df = pd.DataFrame()
+
+                    if not shmu_reality_df.empty:
+                        shmu_to_om_cols: dict[str, str] = {}
+                        for label in selected_vars:
+                            if label not in SHMU_VARIABLE_MAP:
+                                continue
+                            om_col = VARIABLE_MAP[label][0]
+                            shmu_col = SHMU_VARIABLE_MAP[label]
+                            if om_col and shmu_col in shmu_reality_df.columns:
+                                shmu_to_om_cols[shmu_col] = om_col
+
+                        if shmu_to_om_cols:
+                            reality_cols = ["date", *shmu_to_om_cols.keys()]
+                            reality_df = shmu_reality_df[reality_cols].rename(columns=shmu_to_om_cols)
+                            reality_df = reality_df.sort_values("date").drop_duplicates(subset=["date"])
+                            frames["reality"] = reality_df
+                            om_reality_baseline = reality_df
+
+            merged = None
+            if om_source_internal == "both" and "prediction" in frames and "reality" in frames:
+                p_norm = frames["prediction"].copy()
+                r_norm = frames["reality"].copy()
+                p_norm["date"] = _normalize_date_series(p_norm["date"])
+                r_norm["date"] = _normalize_date_series(r_norm["date"])
+                merged = pd.merge(p_norm, r_norm, on="date", how="left", suffixes=("_pred", "_real"))
+
+            if "prediction" in frames and not frames["prediction"].empty:
+                provider_frames["openmeteo"] = frames["prediction"].copy()
+
+            if om_source_internal == "reality":
+                if shmu_caption_name and shmu_caption_ind_kli:
+                    st.caption(f"{shmu_caption_name} | ind_kli={shmu_caption_ind_kli}")
+                elif shmu_caption_name:
+                    st.caption(shmu_caption_name)
+                else:
+                    st.caption(city)
+            elif lat is not None:
                 st.caption(f"{city_name_om} (lat={lat:.4f}, lon={lon:.4f})")
             else:
                 st.caption(city_name_om)
@@ -586,7 +861,7 @@ with col_om:
             tab_labels_om = []
             if om_source_internal == "both":
                 if merged is not None:
-                    tab_labels_om = ["Data", "Comparison"]
+                    tab_labels_om = ["Data", "Chart"]
             else:
                 if "prediction" in frames:
                     tab_labels_om.append("Data")
@@ -599,10 +874,25 @@ with col_om:
                 tabs_om = st.tabs(tab_labels_om)
                 if om_source_internal == "both" and merged is not None:
                     om_reality_baseline = frames.get("reality", pd.DataFrame())
+                    # Keep only variables that have both _pred and _real (SHMU-comparable)
+                    comparable_om = [v for v in om_variables
+                                     if f"{v}_pred" in merged.columns and f"{v}_real" in merged.columns]
+                    if comparable_om:
+                        cmp_cols = ["date"] + [c for v in comparable_om
+                                               for c in (f"{v}_pred", f"{v}_real")]
+                        merged_cmp = merged[cmp_cols].copy()
+                    else:
+                        merged_cmp = pd.DataFrame()
                     with tabs_om[0]:
-                        _show_df("Prediction + Reality", merged, "om_cmp", city, date_from, date_to)
+                        if not merged_cmp.empty:
+                            _show_df("Prediction + Reality", merged_cmp, "om_cmp", city, date_from, date_to)
+                        else:
+                            st.info("No comparable prediction/reality data for selected variables.")
                     with tabs_om[1]:
-                        _show_comparison(merged, list(om_variables), "om")
+                        if not merged_cmp.empty:
+                            _show_comparison(merged_cmp, comparable_om, "om")
+                        else:
+                            st.info("No comparable variables available for comparison.")
                 else:
                     ti = 0
                     if "prediction" in frames:
@@ -621,11 +911,11 @@ with col_om:
                                 _show_chart(frames["reality"], "om_real_chart")
                             else:
                                 st.info("No data to chart.")
-    except Exception as exc:
-        st.error(f"Open-Meteo section failed: {exc}")
+        except Exception as exc:
+            st.error(f"Open-Meteo section failed: {exc}")
 
 # ── Visual Crossing stĺpec ─────────────────────────────────────────────────
-if not reality_only_mode:
+if not reality_only_mode and not custom_mode:
     with col_vc:
         st.header("🌤 Visual Crossing")
         try:
@@ -647,28 +937,29 @@ if not reality_only_mode:
                         df_vc = pd.DataFrame()
                         city_name_vc = city
 
+                if not df_vc.empty:
+                    provider_frames["visualcrossing"] = df_vc.copy()
+
                 st.caption(city_name_vc)
 
                 tab_data_vc, tab_graf_vc = st.tabs(["Data", "Chart"])
+                merged_vc = pd.DataFrame()
+                labels_vc: list[str] = []
+                if om_source_internal == "both":
+                    merged_vc, labels_vc = _build_provider_comparison_df(
+                        df_vc, om_reality_baseline, selected_vars, VARIABLE_MAP, 1, mode
+                    )
                 with tab_data_vc:
                     if om_source_internal == "both":
-                        merged_vc, labels_vc = _build_provider_comparison_df(
-                            df_vc, om_reality_baseline, selected_vars, VARIABLE_MAP, 1, mode
-                        )
-                        if not merged_vc.empty:
-                            _show_df("Prediction + Reality", merged_vc, "vc_cmp", city, date_from, date_to)
-                        else:
-                            st.info("No comparable prediction/reality data.")
+                        _show_provider_comparison_table(merged_vc, labels_vc, "vc")
                     elif not df_vc.empty:
                         _show_df("Prediction", df_vc, "vc_pred", city, date_from, date_to)
                     else:
                         st.info("No data.")
                 with tab_graf_vc:
                     if om_source_internal == "both":
-                        merged_vc, labels_vc = _build_provider_comparison_df(
-                            df_vc, om_reality_baseline, selected_vars, VARIABLE_MAP, 1, mode
-                        )
                         _show_provider_comparison_chart(merged_vc, labels_vc, "vc")
+                        _show_provider_comparison_metrics(merged_vc, labels_vc)
                     elif not df_vc.empty:
                         _show_chart(df_vc, "vc")
                     else:
@@ -677,7 +968,7 @@ if not reality_only_mode:
             st.error(f"Visual Crossing section failed: {exc}")
 
 # ── MET stĺpec ─────────────────────────────────────────────────────────────
-if not reality_only_mode:
+if not reality_only_mode and not custom_mode:
     with row2_col_met:
         st.header("🛰 MET")
         try:
@@ -707,31 +998,32 @@ if not reality_only_mode:
                         lat_met = None
                         lon_met = None
 
+                if not df_met.empty:
+                    provider_frames["met"] = df_met.copy()
+
                 if lat_met is not None:
                     st.caption(f"{_clean_met_city_name(city_name_met)} (lat={lat_met:.4f}, lon={lon_met:.4f})")
                 else:
                     st.caption(_clean_met_city_name(city_name_met))
 
                 tab_data_met, tab_graf_met = st.tabs(["Data", "Chart"])
+                merged_met = pd.DataFrame()
+                labels_met: list[str] = []
+                if om_source_internal == "both":
+                    merged_met, labels_met = _build_provider_comparison_df(
+                        df_met, om_reality_baseline, selected_vars, VARIABLE_MAP, 2, mode
+                    )
                 with tab_data_met:
                     if om_source_internal == "both":
-                        merged_met, labels_met = _build_provider_comparison_df(
-                            df_met, om_reality_baseline, selected_vars, VARIABLE_MAP, 2, mode
-                        )
-                        if not merged_met.empty:
-                            _show_df("Prediction + Reality", merged_met, "met_cmp", city, date_from, date_to)
-                        else:
-                            st.info("No comparable prediction/reality data.")
+                        _show_provider_comparison_table(merged_met, labels_met, "met")
                     elif not df_met.empty:
                         _show_df("Prediction", df_met, "met_pred", city, date_from, date_to)
                     else:
                         st.info("No data.")
                 with tab_graf_met:
                     if om_source_internal == "both":
-                        merged_met, labels_met = _build_provider_comparison_df(
-                            df_met, om_reality_baseline, selected_vars, VARIABLE_MAP, 2, mode
-                        )
                         _show_provider_comparison_chart(merged_met, labels_met, "met")
+                        _show_provider_comparison_metrics(merged_met, labels_met)
                     elif not df_met.empty:
                         _show_chart(df_met, "met")
                     else:
@@ -739,7 +1031,7 @@ if not reality_only_mode:
         except Exception as exc:
             st.error(f"MET section failed: {exc}")
 
-if not reality_only_mode:
+if not reality_only_mode and not custom_mode:
     with row2_col_ms:
         st.header("☁ MeteoSource")
         try:
@@ -769,31 +1061,32 @@ if not reality_only_mode:
                         lat_ms = None
                         lon_ms = None
 
+                if not df_ms.empty:
+                    provider_frames["meteosource"] = df_ms.copy()
+
                 if lat_ms is not None:
                     st.caption(f"{city_name_ms} (lat={lat_ms}, lon={lon_ms})")
                 else:
                     st.caption(city_name_ms)
 
                 tab_data_ms, tab_graf_ms = st.tabs(["Data", "Chart"])
+                merged_ms = pd.DataFrame()
+                labels_ms: list[str] = []
+                if om_source_internal == "both":
+                    merged_ms, labels_ms = _build_provider_comparison_df(
+                        df_ms, om_reality_baseline, selected_vars, VARIABLE_MAP, 3, mode
+                    )
                 with tab_data_ms:
                     if om_source_internal == "both":
-                        merged_ms, labels_ms = _build_provider_comparison_df(
-                            df_ms, om_reality_baseline, selected_vars, VARIABLE_MAP, 3, mode
-                        )
-                        if not merged_ms.empty:
-                            _show_df("Prediction + Reality", merged_ms, "ms_cmp", city, date_from, date_to)
-                        else:
-                            st.info("No comparable prediction/reality data.")
+                        _show_provider_comparison_table(merged_ms, labels_ms, "ms")
                     elif not df_ms.empty:
                         _show_df("Prediction", df_ms, "ms_pred", city, date_from, date_to)
                     else:
                         st.info("No data.")
                 with tab_graf_ms:
                     if om_source_internal == "both":
-                        merged_ms, labels_ms = _build_provider_comparison_df(
-                            df_ms, om_reality_baseline, selected_vars, VARIABLE_MAP, 3, mode
-                        )
                         _show_provider_comparison_chart(merged_ms, labels_ms, "ms")
+                        _show_provider_comparison_metrics(merged_ms, labels_ms)
                     elif not df_ms.empty:
                         _show_chart(df_ms, "ms")
                     else:
@@ -801,7 +1094,7 @@ if not reality_only_mode:
         except Exception as exc:
             st.error(f"MeteoSource section failed: {exc}")
 
-if not reality_only_mode:
+if not reality_only_mode and not custom_mode:
     with shmu_container:
         st.header("🇸🇰 SHMU")
         try:
@@ -829,6 +1122,9 @@ if not reality_only_mode:
                         city_name_shmu = city
                         ind_kli_shmu = None
                         df_shmu = pd.DataFrame()
+
+                if not df_shmu.empty:
+                    provider_frames["shmu"] = df_shmu.copy()
 
                 if ind_kli_shmu is not None:
                     st.caption(f"{city_name_shmu} | ind_kli={ind_kli_shmu}")
@@ -882,21 +1178,24 @@ if not reality_only_mode:
                         lon_sol = None
                         df_sol = pd.DataFrame()
 
+                if not df_sol.empty:
+                    provider_frames["solcast"] = df_sol.copy()
+
                 if lat_sol is not None:
                     st.caption(f"{city_name_sol} (lat={lat_sol:.4f}, lon={lon_sol:.4f})")
                 else:
                     st.caption(city_name_sol)
 
                 tab_data_sol, tab_chart_sol = st.tabs(["Data", "Chart"])
+                merged_sol = pd.DataFrame()
+                labels_sol: list[str] = []
+                if om_source_internal == "both":
+                    merged_sol, labels_sol = _build_provider_comparison_df(
+                        df_sol, om_reality_baseline, selected_vars, VARIABLE_MAP, 4, mode
+                    )
                 with tab_data_sol:
                     if om_source_internal == "both":
-                        merged_sol, labels_sol = _build_provider_comparison_df(
-                            df_sol, om_reality_baseline, selected_vars, VARIABLE_MAP, 4, mode
-                        )
-                        if not merged_sol.empty:
-                            _show_df("Prediction + Reality", merged_sol, "solcast_cmp", city, date_from, date_to)
-                        else:
-                            st.info("No comparable prediction/reality data.")
+                        _show_provider_comparison_table(merged_sol, labels_sol, "solcast")
                     elif not df_sol.empty:
                         df_sol_table = df_sol.drop(columns=["period"], errors="ignore")
                         _show_df("Prediction", df_sol_table, "solcast_pred", city, date_from, date_to)
@@ -904,14 +1203,168 @@ if not reality_only_mode:
                         st.info("No data.")
                 with tab_chart_sol:
                     if om_source_internal == "both":
-                        merged_sol, labels_sol = _build_provider_comparison_df(
-                            df_sol, om_reality_baseline, selected_vars, VARIABLE_MAP, 4, mode
-                        )
                         _show_provider_comparison_chart(merged_sol, labels_sol, "solcast")
+                        _show_provider_comparison_metrics(merged_sol, labels_sol)
                     elif not df_sol.empty:
                         _show_chart(df_sol, "solcast")
                     else:
                         st.info("No data to chart.")
         except Exception as exc:
             st.error(f"Solcast section failed: {exc}")
+
+
+if om_source_internal == "custom":
+    st.divider()
+    st.header("Custom comparison")
+
+    if len(custom_provider_keys) < 2:
+        st.info("Select at least two providers in sidebar for custom comparison.")
+    else:
+        with st.spinner("Loading selected providers for custom comparison..."):
+            # Open-Meteo
+            if use_openmeteo and OM_OK and om_variables:
+                try:
+                    _, _, _, frames_custom_om = load_openmeteo(
+                        city,
+                        str(date_from),
+                        str(date_to),
+                        mode,
+                        tuple(om_variables),
+                        om_timezone,
+                        "custom",
+                    )
+                    df_custom_om = frames_custom_om.get("prediction", pd.DataFrame())
+                    if not df_custom_om.empty:
+                        provider_frames["openmeteo"] = df_custom_om
+                except Exception:
+                    pass
+
+            # Visual Crossing
+            if use_visualcrossing and VC_OK and vc_variables:
+                try:
+                    _, df_custom_vc = load_visualcrossing(
+                        city,
+                        str(date_from),
+                        str(date_to),
+                        mode,
+                        tuple(vc_variables),
+                        vc_timezone,
+                        vc_unit_group,
+                        VC_API_KEY,
+                    )
+                    if not df_custom_vc.empty:
+                        provider_frames["visualcrossing"] = df_custom_vc
+                except Exception:
+                    pass
+
+            # MET
+            if use_met and MET_OK and met_variables:
+                altitude_custom = None
+                if met_altitude_raw.strip():
+                    try:
+                        altitude_custom = int(met_altitude_raw.strip())
+                    except ValueError:
+                        altitude_custom = None
+                try:
+                    _, _, _, df_custom_met = load_met(
+                        city,
+                        str(date_from),
+                        str(date_to),
+                        mode,
+                        tuple(met_variables),
+                        altitude_custom,
+                    )
+                    if not df_custom_met.empty:
+                        provider_frames["met"] = df_custom_met
+                except Exception:
+                    pass
+
+            # MeteoSource
+            if use_meteosource and MS_OK and MS_API_KEY and ms_variables:
+                try:
+                    _, _, _, df_custom_ms = load_meteosource(
+                        city,
+                        str(date_from),
+                        str(date_to),
+                        mode,
+                        tuple(ms_variables),
+                        MS_API_KEY,
+                    )
+                    if not df_custom_ms.empty:
+                        provider_frames["meteosource"] = df_custom_ms
+                except Exception:
+                    pass
+
+            # SHMU
+            if use_shmu and SHMU_OK and mode == "hourly" and shmu_variables:
+                try:
+                    _, _, df_custom_shmu = load_shmu(
+                        city,
+                        str(date_from),
+                        str(date_to),
+                        tuple(shmu_variables),
+                        DEFAULT_SHMU_DATA_TYPE,
+                        SHMU_VERIFY_SSL,
+                    )
+                    if not df_custom_shmu.empty:
+                        provider_frames["shmu"] = df_custom_shmu
+                except Exception:
+                    pass
+
+            # Solcast
+            if use_solcast and SOLCAST_OK and mode == "hourly" and solcast_api_key.strip():
+                effective_solcast_vars = solcast_variables if solcast_variables else ["ghi", "dni", "dhi", "air_temp"]
+                try:
+                    _, _, _, df_custom_sol = load_solcast(
+                        city,
+                        str(date_from),
+                        str(date_to),
+                        tuple(effective_solcast_vars),
+                        DEFAULT_SOLCAST_DATASET_TYPE,
+                        solcast_api_key.strip(),
+                        mode,
+                    )
+                    if not df_custom_sol.empty:
+                        provider_frames["solcast"] = df_custom_sol
+                except Exception:
+                    pass
+
+        comparable_labels = _get_custom_comparable_labels(
+            provider_frames,
+            custom_provider_keys,
+            selected_vars,
+            VARIABLE_MAP,
+            SHMU_VARIABLE_MAP,
+            mode,
+        )
+        if not comparable_labels:
+            st.info("No shared variable available across selected providers.")
+        else:
+            custom_var = st.selectbox(
+                "Variable for custom comparison",
+                options=comparable_labels,
+                key="custom_compare_variable",
+            )
+            merged_custom, used_provider_labels = _build_custom_provider_comparison_df(
+                provider_frames,
+                custom_provider_keys,
+                custom_var,
+                VARIABLE_MAP,
+                SHMU_VARIABLE_MAP,
+                mode,
+            )
+            if merged_custom.empty:
+                st.info("Not enough provider data to compare this variable.")
+            else:
+                st.caption("Compared providers: " + ", ".join(used_provider_labels))
+                _show_df("Providers comparison", merged_custom, "custom_cmp", city, date_from, date_to)
+                chart_custom = merged_custom.copy()
+                chart_custom["date"] = pd.to_datetime(chart_custom["date"], errors="coerce")
+                st.line_chart(chart_custom.set_index("date"))
+                pairwise_metrics_df = _compute_pairwise_metrics_for_variable(merged_custom, used_provider_labels)
+                if not pairwise_metrics_df.empty:
+                    st.subheader(f"Metrics ({custom_var})")
+                    st.caption("Pairwise comparison between selected providers.")
+                    st.dataframe(pairwise_metrics_df, use_container_width=True)
+
 
