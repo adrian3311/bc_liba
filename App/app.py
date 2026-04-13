@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -14,12 +15,19 @@ MET_DIR = ROOT_DIR / "MET"
 METEOSOURCE_DIR = ROOT_DIR / "MeteoSource"
 SHMU_DIR = ROOT_DIR / "SHMU"
 SOLCAST_DIR = ROOT_DIR / "Solcast"
+MARIADB_DIR = ROOT_DIR / "MariaDB"
 VC_API_KEY = os.getenv("VISUAL_CROSSING_API_KEY", "QBY2GE2MTCEFA8TB6586RXWZJ")
 MS_API_KEY = os.getenv("METEOSOURCE_API_KEY", "kvoz0j3rt9h66wt9u8pmbtvgxwipbxbvrm7hcy2t")
 SOLCAST_API_KEY = os.getenv("SOLCAST_API_KEY", "-XOgWsapTi3B3BVhkqsyhllWDM24dolU")
 DEFAULT_SOLCAST_DATASET_TYPE = "radiation_and_weather"
 DEFAULT_SHMU_DATA_TYPE = "aws1min"
 SHMU_VERIFY_SSL = False
+DB_HOST = os.getenv("MARIADB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("MARIADB_PORT", "3306"))
+DB_USER = os.getenv("MARIADB_USER", "root")
+DB_PASSWORD = os.getenv("MARIADB_PASSWORD", "al561860")
+DB_NAME = os.getenv("MARIADB_DATABASE", "weather_viewer")
+DB_ENABLED = os.getenv("MARIADB_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 
 if str(OPEN_METEO_DIR) not in sys.path:
     sys.path.insert(0, str(OPEN_METEO_DIR))
@@ -141,6 +149,163 @@ CUSTOM_PROVIDER_INDEX = {
 }
 CUSTOM_PROVIDER_KEY_BY_LABEL = {v: k for k, v in CUSTOM_PROVIDER_LABELS.items()}
 
+PROVIDER_TABLES = {
+    "openmeteo": "openmeteo_data",
+    "visualcrossing": "visualcrossing_data",
+    "met": "met_data",
+    "meteosource": "meteosource_data",
+    "shmu": "shmu_data",
+    "solcast": "solcast_data",
+}
+
+PROVIDER_COLUMN_TO_DB = {
+    "openmeteo": {
+        "temperature_2m": "temperature",
+        "temperature_2m_min": "temperature_min",
+        "temperature_2m_max": "temperature_max",
+        "temperature_2m_mean": "temperature_mean",
+        "cloud_cover": "cloud_cover",
+        "rain": "precipitation",
+        "precipitation_sum": "precipitation_sum",
+        "rain_sum": "precipitation_sum",
+        "relative_humidity_2m": "humidity",
+        "wind_speed_10m": "wind_speed",
+        "wind_speed_10m_max": "wind_speed",
+        "wind_direction_10m": "wind_direction",
+        "wind_direction_10m_dominant": "wind_direction",
+        "wind_gusts_10m": "wind_gusts",
+        "wind_gusts_10m_max": "wind_gusts",
+        "shortwave_radiation": "solar_radiation",
+        "shortwave_radiation_sum": "solar_radiation",
+        "uv_index": "uv_index",
+        "visibility": "visibility",
+        "surface_pressure": "surface_pressure",
+        "snowfall": "snow",
+        "snowfall_sum": "snow",
+        "weather_code": "weather_code",
+        "fog": "fog",
+        "cape": "cape",
+        "et0_fao_evapotranspiration": "evapotranspiration",
+        "vapour_pressure_deficit": "vapour_pressure_deficit",
+        "sunshine_duration": "sunshine_duration",
+        "precipitation_hours": "precipitation_hours",
+    },
+    "visualcrossing": {
+        "temp": "temperature",
+        "tempmin": "temperature_min",
+        "tempmax": "temperature_max",
+        "cloudcover": "cloud_cover",
+        "precip": "precipitation",
+        "humidity": "humidity",
+        "windspeed": "wind_speed",
+        "winddir": "wind_direction",
+        "windgust": "wind_gusts",
+        "solarradiation": "solar_radiation",
+        "uvindex": "uv_index",
+        "visibility": "visibility",
+        "pressure": "surface_pressure",
+        "dewpoint": "dew_point",
+        "feelslike": "feels_like",
+        "snow": "snow",
+        "conditions": "weather_code",
+        "cape": "cape",
+        "solarenergy": "sunshine_duration",
+    },
+    "met": {
+        "temperature_2m": "temperature",
+        "temperature_2m_min": "temperature_min",
+        "temperature_2m_max": "temperature_max",
+        "temperature_2m_mean": "temperature_mean",
+        "cloud_cover": "cloud_cover",
+        "precipitation_1h": "precipitation",
+        "precipitation_1h_sum": "precipitation_sum",
+        "humidity": "humidity",
+        "wind_speed": "wind_speed",
+        "wind_direction": "wind_direction",
+        "wind_speed_gust": "wind_gusts",
+        "uv_index": "uv_index",
+        "pressure": "surface_pressure",
+        "dew_point": "dew_point",
+        "symbol_1h": "weather_code",
+        "precipitation_prob_1h": "precipitation_probability",
+        "thunder_prob_1h": "thunder_probability",
+        "fog": "fog",
+    },
+    "meteosource": {
+        "temperature": "temperature",
+        "temperature_min": "temperature_min",
+        "temperature_max": "temperature_max",
+        "cloud_cover": "cloud_cover",
+        "precipitation_sum": "precipitation_sum",
+        "humidity": "humidity",
+        "wind_speed": "wind_speed",
+        "wind_direction": "wind_direction",
+        "uv_index": "uv_index",
+        "visibility": "visibility",
+        "pressure": "surface_pressure",
+        "dew_point": "dew_point",
+        "feels_like": "feels_like",
+        "weather": "weather_code",
+    },
+    "shmu": {
+        "t": "temperature",
+        "zra_uhrn": "precipitation_sum",
+        "vlh_rel": "humidity",
+        "vie_pr_rych": "wind_speed",
+        "vie_pr_smer": "wind_direction",
+        "vie_max_rych": "wind_gusts",
+        "zglo": "solar_radiation",
+        "dohl": "visibility",
+        "tlak": "surface_pressure",
+        "sneh_pokr": "snow",
+        "stav_poc": "weather_code",
+        "sln_trv": "sunshine_duration",
+    },
+    "solcast": {
+        "air_temp": "temperature",
+        "cloud_opacity": "cloud_cover",
+        "precipitation_rate": "precipitation",
+        "relative_humidity": "humidity",
+        "wind_speed_10m": "wind_speed",
+        "wind_direction_10m": "wind_direction",
+        "ghi": "solar_radiation",
+        "surface_pressure": "surface_pressure",
+        "dewpoint_temp": "dew_point",
+        "snow_depth": "snow",
+        "weather_type": "weather_code",
+    },
+}
+
+DB_WEATHER_COLUMNS = {
+    "temperature",
+    "temperature_min",
+    "temperature_max",
+    "temperature_mean",
+    "cloud_cover",
+    "precipitation",
+    "precipitation_sum",
+    "precipitation_probability",
+    "humidity",
+    "wind_speed",
+    "wind_direction",
+    "wind_gusts",
+    "solar_radiation",
+    "uv_index",
+    "visibility",
+    "surface_pressure",
+    "dew_point",
+    "feels_like",
+    "snow",
+    "weather_code",
+    "thunder_probability",
+    "fog",
+    "cape",
+    "evapotranspiration",
+    "vapour_pressure_deficit",
+    "sunshine_duration",
+    "precipitation_hours",
+}
+
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _clean_met_city_name(name: str) -> str:
@@ -155,6 +320,183 @@ def _csv_bytes(df: pd.DataFrame) -> bytes:
 
 def _show_provider_fetch_notice() -> None:
     return
+
+
+def _db_connect():
+    import pymysql
+
+    return pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        charset="utf8mb4",
+        autocommit=True,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def _to_db_datetime(value) -> datetime | None:
+    dt = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(dt):
+        return None
+    return dt.to_pydatetime().replace(tzinfo=None)
+
+
+def _to_db_number(value):
+    if pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _persist_provider_dataframe(
+    provider_key: str,
+    df: pd.DataFrame,
+    city: str,
+    resolved_city: str,
+    mode: str,
+    data_kind: str,
+    latitude=None,
+    longitude=None,
+    station_id=None,
+    timezone_name=None,
+    unit_system=None,
+):
+    if not DB_ENABLED or df.empty or "date" not in df.columns:
+        return
+
+    table = PROVIDER_TABLES.get(provider_key)
+    column_map = PROVIDER_COLUMN_TO_DB.get(provider_key, {})
+    if not table:
+        return
+
+    base_cols = [
+        "city",
+        "resolved_city",
+        "station_id",
+        "granularity",
+        "data_kind",
+        "forecast_for",
+        "latitude",
+        "longitude",
+        "timezone_name",
+        "unit_system",
+        *sorted(DB_WEATHER_COLUMNS),
+        "raw_payload",
+    ]
+
+    insert_sql = (
+        f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in base_cols)}) "
+        f"VALUES ({', '.join(['%s'] * len(base_cols))}) "
+        "ON DUPLICATE KEY UPDATE "
+        + ", ".join(f"`{c}`=VALUES(`{c}`)" for c in base_cols if c not in {"city", "forecast_for", "granularity", "data_kind"})
+    )
+
+    rows_to_insert: list[list] = []
+    for _, row in df.iterrows():
+        forecast_for = _to_db_datetime(row.get("date"))
+        if forecast_for is None:
+            continue
+
+        record = {c: None for c in base_cols}
+        record.update(
+            {
+                "city": city,
+                "resolved_city": resolved_city,
+                "station_id": str(station_id) if station_id is not None else None,
+                "granularity": mode,
+                "data_kind": data_kind,
+                "forecast_for": forecast_for,
+                "latitude": _to_db_number(latitude),
+                "longitude": _to_db_number(longitude),
+                "timezone_name": timezone_name,
+                "unit_system": unit_system,
+                "raw_payload": json.dumps({k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}, default=str),
+            }
+        )
+
+        for provider_col, db_col in column_map.items():
+            if provider_col not in df.columns:
+                continue
+            value = row.get(provider_col)
+            if db_col == "weather_code":
+                record[db_col] = None if pd.isna(value) else str(value)
+            else:
+                record[db_col] = _to_db_number(value)
+
+        rows_to_insert.append([record[c] for c in base_cols])
+
+    if not rows_to_insert:
+        return
+
+    conn = _db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(insert_sql, rows_to_insert)
+    finally:
+        conn.close()
+
+
+def _load_provider_dataframe(
+    provider_key: str,
+    city: str,
+    start_date: str,
+    end_date: str,
+    mode: str,
+    data_kind: str,
+    provider_columns: list[str],
+) -> pd.DataFrame:
+    if not DB_ENABLED:
+        return pd.DataFrame()
+
+    table = PROVIDER_TABLES.get(provider_key)
+    column_map = PROVIDER_COLUMN_TO_DB.get(provider_key, {})
+    if not table:
+        return pd.DataFrame()
+
+    selected_db_cols = sorted({column_map[c] for c in provider_columns if c in column_map})
+    query_cols = ["forecast_for", *selected_db_cols]
+    query = (
+        f"SELECT {', '.join(f'`{c}`' for c in query_cols)} "
+        f"FROM `{table}` "
+        "WHERE `city`=%s AND `granularity`=%s AND `data_kind`=%s "
+        "AND `forecast_for` BETWEEN %s AND %s "
+        "ORDER BY `forecast_for` ASC"
+    )
+
+    start_dt = pd.to_datetime(start_date).strftime("%Y-%m-%d 00:00:00")
+    end_dt = pd.to_datetime(end_date).strftime("%Y-%m-%d 23:59:59")
+
+    conn = _db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, (city, mode, data_kind, start_dt, end_dt))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return pd.DataFrame()
+
+    reverse_map = {v: k for k, v in column_map.items()}
+    out_rows: list[dict] = []
+    for row in rows:
+        out = {"date": row.get("forecast_for")}
+        for db_col in selected_db_cols:
+            provider_col = reverse_map.get(db_col)
+            if provider_col is None:
+                continue
+            out[provider_col] = row.get(db_col)
+        out_rows.append(out)
+
+    result = pd.DataFrame(out_rows)
+    if "date" in result.columns:
+        result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    return result
 
 
 def _show_df(label: str, df: pd.DataFrame, file_prefix: str, city: str, date_from, date_to):
@@ -479,7 +821,23 @@ def load_openmeteo(city, start_date, end_date, mode, variables, timezone, source
     frames: dict[str, pd.DataFrame] = {}
     if source in ("prediction", "both", "custom"):
         r = om_fetch_prediction(client, lat, lon, start_date, end_date, list(variables), timezone, mode)
-        frames["prediction"] = om_to_dataframe(r, list(variables), mode)
+        fetched_df = om_to_dataframe(r, list(variables), mode)
+        try:
+            _persist_provider_dataframe(
+                provider_key="openmeteo",
+                df=fetched_df,
+                city=city,
+                resolved_city=city_name,
+                mode=mode,
+                data_kind="prediction",
+                latitude=lat,
+                longitude=lon,
+                timezone_name=timezone,
+            )
+            db_df = _load_provider_dataframe("openmeteo", city, start_date, end_date, mode, "prediction", list(variables))
+        except Exception:
+            db_df = pd.DataFrame()
+        frames["prediction"] = db_df if not db_df.empty else fetched_df
     return city_name, lat, lon, frames
 
 
@@ -495,7 +853,20 @@ def load_shmu_reality_baseline(city, start_date, end_date, shmu_fields, verify_s
     )
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    return city_name, ind_kli, df
+    try:
+        _persist_provider_dataframe(
+            provider_key="shmu",
+            df=df,
+            city=city,
+            resolved_city=city_name,
+            mode="hourly",
+            data_kind="reality",
+            station_id=ind_kli,
+        )
+        db_df = _load_provider_dataframe("shmu", city, start_date, end_date, "hourly", "reality", list(shmu_fields))
+    except Exception:
+        db_df = pd.DataFrame()
+    return city_name, ind_kli, (db_df if not db_df.empty else df)
 
 
 @st.cache_data(show_spinner=False)
@@ -508,7 +879,21 @@ def load_visualcrossing(city, start_date, end_date, mode, variables, timezone, u
     df = pd.DataFrame(rows)
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
-    return city_name, df
+    try:
+        _persist_provider_dataframe(
+            provider_key="visualcrossing",
+            df=df,
+            city=city,
+            resolved_city=city_name,
+            mode=mode,
+            data_kind="prediction",
+            timezone_name=timezone,
+            unit_system=unit_group,
+        )
+        db_df = _load_provider_dataframe("visualcrossing", city, start_date, end_date, mode, "prediction", list(variables))
+    except Exception:
+        db_df = pd.DataFrame()
+    return city_name, (db_df if not db_df.empty else df)
 
 
 @st.cache_data(show_spinner=False)
@@ -551,7 +936,22 @@ def load_met(city, start_date, end_date, mode, variables, altitude):
                 out[f"{col}_mean"] = grouped[col].mean().values
         df = out
 
-    return city_name, lat, lon, df
+    requested_cols = [c for c in df.columns if c != "date"]
+    try:
+        _persist_provider_dataframe(
+            provider_key="met",
+            df=df,
+            city=city,
+            resolved_city=city_name,
+            mode=mode,
+            data_kind="prediction",
+            latitude=lat,
+            longitude=lon,
+        )
+        db_df = _load_provider_dataframe("met", city, start_date, end_date, mode, "prediction", requested_cols)
+    except Exception:
+        db_df = pd.DataFrame()
+    return city_name, lat, lon, (db_df if not db_df.empty else df)
 
 
 @st.cache_data(show_spinner=False)
@@ -567,7 +967,21 @@ def load_meteosource(city, start_date, end_date, mode, variables, api_key):
     df = pd.DataFrame(rows)
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    return city_name, lat, lon, df
+    try:
+        _persist_provider_dataframe(
+            provider_key="meteosource",
+            df=df,
+            city=city,
+            resolved_city=city_name,
+            mode=mode,
+            data_kind="prediction",
+            latitude=lat,
+            longitude=lon,
+        )
+        db_df = _load_provider_dataframe("meteosource", city, start_date, end_date, mode, "prediction", list(variables))
+    except Exception:
+        db_df = pd.DataFrame()
+    return city_name, lat, lon, (db_df if not db_df.empty else df)
 
 
 @st.cache_data(show_spinner=False)
@@ -582,7 +996,20 @@ def load_shmu(city, start_date, end_date, variables, data_file_type, verify_ssl)
     )
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    return city_name, ind_kli, df
+    try:
+        _persist_provider_dataframe(
+            provider_key="shmu",
+            df=df,
+            city=city,
+            resolved_city=city_name,
+            mode="hourly",
+            data_kind="prediction",
+            station_id=ind_kli,
+        )
+        db_df = _load_provider_dataframe("shmu", city, start_date, end_date, "hourly", "prediction", list(variables))
+    except Exception:
+        db_df = pd.DataFrame()
+    return city_name, ind_kli, (db_df if not db_df.empty else df)
 
 
 @st.cache_data(show_spinner=False)
@@ -603,7 +1030,21 @@ def load_solcast(city, start_date, end_date, variables, dataset_type, api_key, m
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         # Solcast often returns 30-minute points; keep whole-hour records only.
         df = df[df["date"].dt.minute == 0].reset_index(drop=True)
-    return city_name, lat, lon, df
+    try:
+        _persist_provider_dataframe(
+            provider_key="solcast",
+            df=df,
+            city=city,
+            resolved_city=city_name,
+            mode=mode,
+            data_kind="prediction",
+            latitude=lat,
+            longitude=lon,
+        )
+        db_df = _load_provider_dataframe("solcast", city, start_date, end_date, mode, "prediction", list(variables))
+    except Exception:
+        db_df = pd.DataFrame()
+    return city_name, lat, lon, (db_df if not db_df.empty else df)
 
 
 # ── UI ──────────────────────────────────────────────────────────────────────
@@ -779,6 +1220,10 @@ if not custom_mode:
         try:
             shmu_caption_name = None
             shmu_caption_ind_kli = None
+            # Keep defaults so downstream tab rendering is stable even when OM is disabled/fails.
+            frames: dict[str, pd.DataFrame] = {}
+            city_name_om = city
+            lat, lon = None, None
             if not use_openmeteo:
                 st.info("Open-Meteo is disabled in the sidebar.")
             elif not OM_OK:
@@ -801,7 +1246,8 @@ if not custom_mode:
                 if not SHMU_OK:
                     st.error(f"SHMU module load failed for reality source: {SHMU_ERR}")
                 elif mode != "hourly":
-                    st.info("Reality source currently supports hourly mode only (SHMU).")
+                    if om_source_internal == "reality":
+                        st.info("Reality source currently supports hourly mode only (SHMU).")
                 elif not shmu_variables:
                     st.warning("No SHMU-equivalent variables for current selection.")
                 else:
@@ -858,22 +1304,13 @@ if not custom_mode:
             else:
                 st.caption(city_name_om)
 
-            tab_labels_om = []
+            tab_labels_om = ["Data", "Chart"]
+            tabs_om = st.tabs(tab_labels_om)
             if om_source_internal == "both":
+                om_reality_baseline = frames.get("reality", pd.DataFrame())
+                comparable_om: list[str] = []
+                merged_cmp = pd.DataFrame()
                 if merged is not None:
-                    tab_labels_om = ["Data", "Chart"]
-            else:
-                if "prediction" in frames:
-                    tab_labels_om.append("Data")
-                if "reality" in frames:
-                    tab_labels_om.append("Data")
-                if frames:
-                    tab_labels_om.append("Chart")
-
-            if tab_labels_om:
-                tabs_om = st.tabs(tab_labels_om)
-                if om_source_internal == "both" and merged is not None:
-                    om_reality_baseline = frames.get("reality", pd.DataFrame())
                     # Keep only variables that have both _pred and _real (SHMU-comparable)
                     comparable_om = [v for v in om_variables
                                      if f"{v}_pred" in merged.columns and f"{v}_real" in merged.columns]
@@ -881,36 +1318,30 @@ if not custom_mode:
                         cmp_cols = ["date"] + [c for v in comparable_om
                                                for c in (f"{v}_pred", f"{v}_real")]
                         merged_cmp = merged[cmp_cols].copy()
+                with tabs_om[0]:
+                    if not merged_cmp.empty:
+                        _show_df("Prediction + Reality", merged_cmp, "om_cmp", city, date_from, date_to)
                     else:
-                        merged_cmp = pd.DataFrame()
-                    with tabs_om[0]:
-                        if not merged_cmp.empty:
-                            _show_df("Prediction + Reality", merged_cmp, "om_cmp", city, date_from, date_to)
-                        else:
-                            st.info("No comparable prediction/reality data for selected variables.")
-                    with tabs_om[1]:
-                        if not merged_cmp.empty:
-                            _show_comparison(merged_cmp, comparable_om, "om")
-                        else:
-                            st.info("No comparable variables available for comparison.")
-                else:
-                    ti = 0
-                    if "prediction" in frames:
-                        with tabs_om[ti]:
-                            _show_df("Prediction", frames["prediction"], "om_pred", city, date_from, date_to)
-                        ti += 1
-                    if "reality" in frames:
-                        with tabs_om[ti]:
-                            _show_df("Reality", frames["reality"], "om_real", city, date_from, date_to)
-                        ti += 1
-                    if frames:
-                        with tabs_om[ti]:
-                            if "prediction" in frames:
-                                _show_chart(frames["prediction"], "om_pred_chart")
-                            elif "reality" in frames:
-                                _show_chart(frames["reality"], "om_real_chart")
-                            else:
-                                st.info("No data to chart.")
+                        st.info("No comparable prediction/reality data.")
+                with tabs_om[1]:
+                    _show_provider_comparison_chart(merged_cmp, comparable_om, "om")
+                    _show_provider_comparison_metrics(merged_cmp, comparable_om)
+            else:
+                with tabs_om[0]:
+                    if "prediction" in frames and not frames["prediction"].empty:
+                        _show_df("Prediction", frames["prediction"], "om_pred", city, date_from, date_to)
+                    elif "reality" in frames and not frames["reality"].empty:
+                        _show_df("Reality", frames["reality"], "om_real", city, date_from, date_to)
+                    else:
+                        st.info("No data.")
+                with tabs_om[1]:
+                    if "prediction" in frames and not frames["prediction"].empty:
+                        _show_chart(frames["prediction"], "om_pred_chart")
+                    elif "reality" in frames and not frames["reality"].empty:
+                        _show_chart(frames["reality"], "om_real_chart")
+                    else:
+                        st.info("No data to chart.")
+            # --- end Open-Meteo
         except Exception as exc:
             st.error(f"Open-Meteo section failed: {exc}")
 
