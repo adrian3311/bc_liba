@@ -937,6 +937,8 @@ def load_met(city, start_date, end_date, mode, variables, altitude):
         df = out
 
     requested_cols = [c for c in df.columns if c != "date"]
+    if not requested_cols:
+        requested_cols = list(variables)
     try:
         _persist_provider_dataframe(
             provider_key="met",
